@@ -175,8 +175,5 @@ http://localhost:8000/csv-merger.html
 - Fortschrittsanzeige bei sehr vielen Dateien
 - Tests für Parser, Delimiter-Erkennung und Union-Merge
 
-## Lizenz
 
-Noch keine Lizenz angegeben.  
-Wenn das Repository öffentlich genutzt oder geteilt werden soll, empfiehlt sich eine klare Lizenz, zum Beispiel MIT.
 
