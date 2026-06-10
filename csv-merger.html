@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>CSV Merger</title>
+<style>
+  :root{
+    --bg:#111110; --panel:#1b1b19; --panel2:#232320; --line:#34332e;
+    --txt:#e8e6df; --dim:#9c988b; --acc:#c9a35a; --acc2:#8fb37a;
+    --warn:#d98a5a; --err:#d9655a; --radius:10px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
+    padding:max(16px,env(safe-area-inset-top)) 16px 60px;}
+  h1{font-size:20px;margin:0 0 2px;letter-spacing:.5px}
+  .sub{color:var(--dim);font-size:13px;margin:0 0 18px}
+  .panel{background:var(--panel);border:1px solid var(--line);
+    border-radius:var(--radius);padding:16px;margin-bottom:16px}
+  .drop{border:2px dashed var(--line);border-radius:var(--radius);
+    padding:28px 16px;text-align:center;color:var(--dim);cursor:pointer;
+    transition:.15s;background:var(--panel)}
+  .drop.over{border-color:var(--acc);color:var(--txt);background:var(--panel2)}
+  .drop strong{color:var(--txt)}
+  input[type=file]{display:none}
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .grp-head{display:flex;justify-content:space-between;align-items:center;
+    gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  .grp-title{font-weight:600;font-size:15px}
+  .tag{display:inline-block;font-size:11px;padding:2px 8px;border-radius:20px;
+    background:var(--panel2);color:var(--dim);border:1px solid var(--line)}
+  .hdr{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;
+    color:var(--dim);background:var(--bg);border:1px solid var(--line);
+    border-radius:6px;padding:8px 10px;margin:8px 0;word-break:break-all;
+    white-space:pre-wrap}
+  .files{list-style:none;margin:6px 0 0;padding:0}
+  .files li{display:flex;justify-content:space-between;gap:8px;
+    padding:5px 0;border-top:1px solid var(--line);font-size:13px}
+  .files li:first-child{border-top:none}
+  .fn{color:var(--txt);word-break:break-all}
+  .meta{color:var(--dim);white-space:nowrap}
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--txt);padding:8px 14px;transition:.12s}
+  button:hover{border-color:var(--acc)}
+  button.primary{background:var(--acc);color:#1a1500;border-color:var(--acc);font-weight:600}
+  button.ghost{background:transparent}
+  button.danger:hover{border-color:var(--err);color:var(--err)}
+  button:disabled{opacity:.4;cursor:not-allowed}
+  .small{font-size:13px;padding:5px 10px}
+  label.chk{display:inline-flex;align-items:center;gap:6px;color:var(--dim);
+    font-size:13px;cursor:pointer;user-select:none}
+  select{font:inherit;background:var(--panel2);color:var(--txt);
+    border:1px solid var(--line);border-radius:6px;padding:5px 8px}
+  .union-box{margin-top:14px;border-top:1px solid var(--line);padding-top:14px}
+  .union-pick{display:flex;flex-direction:column;gap:6px;margin:8px 0}
+  .empty{color:var(--dim);text-align:center;padding:20px 0;font-size:14px}
+  .hint{color:var(--dim);font-size:12px;margin-top:6px}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+  .pill{font-size:11px;padding:1px 7px;border-radius:20px;background:var(--bg);
+    border:1px solid var(--line);color:var(--acc2)}
+  .pill.warn{color:var(--warn)}
+</style>
+</head>
+<body>
+<h1>CSV Merger</h1>
+<p class="sub">Viele kleine CSVs einladen · nach Header gruppieren · pro Gruppe zu einer Datei zusammenführen.</p>
+
+<div class="panel">
+  <div class="drop" id="drop">
+    <strong>CSV-Dateien hierher ziehen</strong> oder klicken zum Auswählen<br>
+    <span style="font-size:12px">Mehrere Dateien gleichzeitig möglich</span>
+  </div>
+  <input type="file" id="file" accept=".csv,.tsv,.txt,text/csv" multiple>
+  <div class="row" style="margin-top:12px;justify-content:space-between">
+    <label class="chk"><input type="checkbox" id="bom" checked> UTF-8 BOM beim Export voranstellen</label>
+    <button class="ghost small danger" id="clear">Alles leeren</button>
+  </div>
+</div>
+
+<div id="groups"></div>
+
+<script>
+"use strict";
+
+/* ---------- State ---------- */
+var FILES = []; // {name, text, delim, header[], rows[][]}
+
+/* ---------- Delimiter-Erkennung ---------- */
+function detectDelim(text){
+  var firstLine = text.split(/\r\n|\n|\r/)[0] || "";
+  var cands = [";", ",", "\t", "|"];
+  var best = ",", bestN = -1;
+  cands.forEach(function(d){
+    var n = countOutsideQuotes(firstLine, d);
+    if(n > bestN){ bestN = n; best = d; }
+  });
+  return best;
+}
+function countOutsideQuotes(line, ch){
+  var n=0, q=false;
+  for(var i=0;i<line.length;i++){
+    var c=line[i];
+    if(c === '"'){ q = !q; }
+    else if(c === ch && !q){ n++; }
+  }
+  return n;
+}
+
+/* ---------- RFC-4180 Parser ---------- */
+function parseCSV(text, delim){
+  // BOM entfernen
+  if(text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  var rows=[], field="", row=[], i=0, q=false, n=text.length;
+  while(i<n){
+    var c=text[i];
+    if(q){
+      if(c === '"'){
+        if(text[i+1] === '"'){ field+='"'; i+=2; continue; }
+        q=false; i++; continue;
+      }
+      field+=c; i++; continue;
+    }
+    if(c === '"'){ q=true; i++; continue; }
+    if(c === delim){ row.push(field); field=""; i++; continue; }
+    if(c === '\n' || c === '\r'){
+      if(c === '\r' && text[i+1] === '\n') i++;
+      row.push(field); rows.push(row); field=""; row=[]; i++; continue;
+    }
+    field+=c; i++;
+  }
+  // letzten Rest abschließen
+  if(field.length>0 || row.length>0){ row.push(field); rows.push(row); }
+  // komplett leere Zeilen am Ende entfernen
+  while(rows.length && rows[rows.length-1].every(function(x){return x===""})) rows.pop();
+  return rows;
+}
+
+/* ---------- CSV serialisieren ---------- */
+function escapeField(v, delim){
+  v = (v==null) ? "" : String(v);
+  if(v.indexOf('"')>=0 || v.indexOf(delim)>=0 || v.indexOf("\n")>=0 || v.indexOf("\r")>=0){
+    return '"' + v.replace(/"/g,'""') + '"';
+  }
+  return v;
+}
+function toCSV(header, rows, delim){
+  var out = [header.map(function(h){return escapeField(h,delim)}).join(delim)];
+  rows.forEach(function(r){
+    out.push(r.map(function(c){return escapeField(c,delim)}).join(delim));
+  });
+  return out.join("\r\n");
+}
+
+/* ---------- Gruppierung nach Header ---------- */
+function headerKey(header){ return header.join("\u0001"); }
+
+function buildGroups(){
+  var map = {}; // key -> {header, files:[], delim}
+  FILES.forEach(function(f){
+    var k = headerKey(f.header);
+    if(!map[k]) map[k] = {header:f.header, files:[], delim:f.delim};
+    map[k].files.push(f);
+  });
+  return Object.keys(map).map(function(k){ return map[k]; });
+}
+
+/* ---------- Dateien einlesen ---------- */
+function ingest(fileList){
+  var arr = Array.prototype.slice.call(fileList);
+  var pending = arr.length;
+  if(!pending) return;
+  arr.forEach(function(file){
+    var reader = new FileReader();
+    reader.onload = function(){
+      var text = String(reader.result || "");
+      var delim = detectDelim(text);
+      var rows = parseCSV(text, delim);
+      var header = rows.length ? rows[0] : [];
+      var body = rows.slice(1);
+      FILES.push({name:file.name, text:text, delim:delim, header:header, rows:body});
+      pending--;
+      if(pending===0) render();
+    };
+    reader.onerror = function(){ pending--; if(pending===0) render(); };
+    reader.readAsText(file); // UTF-8
+  });
+}
+
+/* ---------- Download ---------- */
+function download(filename, csvText){
+  var bom = document.getElementById("bom").checked ? "\uFEFF" : "";
+  var blob = new Blob([bom + csvText], {type:"text/csv;charset=utf-8"});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a);
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
+}
+
+function delimLabel(d){
+  return d===";"?"Semikolon":d===","?"Komma":d==="\t"?"Tab":d==="|"?"Pipe":d;
+}
+
+/* ---------- Merge einer Header-Gruppe ---------- */
+function mergeGroup(g){
+  var allRows = [];
+  g.files.forEach(function(f){ allRows = allRows.concat(f.rows); });
+  return toCSV(g.header, allRows, g.delim);
+}
+
+/* ---------- Union-Merge ausgewählter Gruppen ---------- */
+function unionMerge(selectedGroups, delim){
+  // Spalten-Union in stabiler Reihenfolge bilden
+  var cols = [], seen = {};
+  selectedGroups.forEach(function(g){
+    g.header.forEach(function(h){
+      if(!seen[h]){ seen[h]=true; cols.push(h); }
+    });
+  });
+  var rows = [];
+  selectedGroups.forEach(function(g){
+    var idx = g.header.map(function(h){ return cols.indexOf(h); });
+    g.files.forEach(function(f){
+      f.rows.forEach(function(r){
+        var nr = new Array(cols.length).fill("");
+        for(var j=0;j<r.length;j++){
+          var target = idx[j];
+          if(target>=0) nr[target] = r[j];
+        }
+        rows.push(nr);
+      });
+    });
+  });
+  return toCSV(cols, rows, delim);
+}
+
+/* ---------- Render ---------- */
+function render(){
+  var root = document.getElementById("groups");
+  root.innerHTML = "";
+  if(!FILES.length){
+    root.innerHTML = '<div class="panel empty">Noch keine Dateien geladen.</div>';
+    return;
+  }
+  var groups = buildGroups();
+
+  // Übersicht
+  var bar = document.createElement("div");
+  bar.className = "toolbar";
+  bar.innerHTML = '<span class="pill">'+FILES.length+' Datei'+(FILES.length>1?'en':'')+'</span>'+
+    '<span class="pill'+(groups.length>1?' warn':'')+'">'+groups.length+
+    ' Header-Gruppe'+(groups.length>1?'n':'')+'</span>';
+  root.appendChild(bar);
+
+  // Pro Gruppe ein Panel
+  groups.forEach(function(g, gi){
+    var totalRows = g.files.reduce(function(s,f){return s+f.rows.length},0);
+    var p = document.createElement("div");
+    p.className = "panel";
+    var head = document.createElement("div");
+    head.className = "grp-head";
+    head.innerHTML =
+      '<span class="grp-title">Gruppe '+(gi+1)+'</span>'+
+      '<span class="row">'+
+        '<span class="tag">'+g.header.length+' Spalten</span>'+
+        '<span class="tag">'+g.files.length+' Datei'+(g.files.length>1?'en':'')+'</span>'+
+        '<span class="tag">'+totalRows+' Zeilen</span>'+
+        '<span class="tag">'+delimLabel(g.delim)+'</span>'+
+      '</span>';
+    p.appendChild(head);
+
+    var hdr = document.createElement("div");
+    hdr.className = "hdr";
+    hdr.textContent = g.header.join("  |  ") || "(leerer Header)";
+    p.appendChild(hdr);
+
+    var ul = document.createElement("ul");
+    ul.className = "files";
+    g.files.forEach(function(f){
+      var li = document.createElement("li");
+      var fn = document.createElement("span");
+      fn.className="fn"; fn.textContent = f.name;
+      var mt = document.createElement("span");
+      mt.className="meta"; mt.textContent = f.rows.length + " Zeilen";
+      li.appendChild(fn); li.appendChild(mt);
+      ul.appendChild(li);
+    });
+    p.appendChild(ul);
+
+    var actions = document.createElement("div");
+    actions.className = "row";
+    actions.style.marginTop = "12px";
+    var btn = document.createElement("button");
+    btn.className = "primary small";
+    btn.textContent = "Gruppe "+(gi+1)+" zusammenführen ↓";
+    btn.onclick = function(){
+      var name = "merge_gruppe_"+(gi+1)+".csv";
+      download(name, mergeGroup(g));
+    };
+    actions.appendChild(btn);
+    p.appendChild(actions);
+
+    root.appendChild(p);
+  });
+
+  // Union-Merge-Bereich nur bei >1 Gruppe
+  if(groups.length > 1){
+    var up = document.createElement("div");
+    up.className = "panel";
+    up.innerHTML = '<div class="grp-title">Gruppen mit unterschiedlichen Headern vereinen</div>'+
+      '<div class="hint">Wähle die Gruppen, die in eine gemeinsame Datei sollen. '+
+      'Fehlende Spalten werden je Zeile leer gefüllt. Spalten-Union in stabiler Reihenfolge.</div>';
+    var box = document.createElement("div");
+    box.className = "union-pick";
+    groups.forEach(function(g, gi){
+      var lab = document.createElement("label");
+      lab.className = "chk";
+      lab.innerHTML = '<input type="checkbox" class="ucheck" data-gi="'+gi+'"> '+
+        'Gruppe '+(gi+1)+' — '+g.header.length+' Spalten ('+g.header.slice(0,4).join(", ")+
+        (g.header.length>4?" …":"")+')';
+      box.appendChild(lab);
+    });
+    up.appendChild(box);
+
+    var urow = document.createElement("div");
+    urow.className = "row";
+    urow.innerHTML = '<span class="hint" style="margin:0 8px 0 0">Delimiter der Ausgabe:</span>';
+    var sel = document.createElement("select");
+    sel.id = "udelim";
+    [[";","Semikolon"],[",","Komma"],["\t","Tab"],["|","Pipe"]].forEach(function(o){
+      var op=document.createElement("option"); op.value=o[0]; op.textContent=o[1];
+      sel.appendChild(op);
+    });
+    urow.appendChild(sel);
+    var ubtn = document.createElement("button");
+    ubtn.className = "primary small";
+    ubtn.textContent = "Ausgewählte vereinen ↓";
+    ubtn.style.marginLeft = "8px";
+    ubtn.onclick = function(){
+      var picks = [];
+      document.querySelectorAll(".ucheck:checked").forEach(function(c){
+        picks.push(groups[parseInt(c.getAttribute("data-gi"),10)]);
+      });
+      if(picks.length < 2){ alert("Bitte mindestens zwei Gruppen auswählen."); return; }
+      download("union_merge.csv", unionMerge(picks, sel.value));
+    };
+    urow.appendChild(ubtn);
+    up.appendChild(urow);
+    root.appendChild(up);
+  }
+}
+
+/* ---------- Events ---------- */
+var drop = document.getElementById("drop");
+var fileInput = document.getElementById("file");
+drop.addEventListener("click", function(){ fileInput.click(); });
+fileInput.addEventListener("change", function(e){ ingest(e.target.files); fileInput.value=""; });
+["dragenter","dragover"].forEach(function(ev){
+  drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.add("over"); });
+});
+["dragleave","drop"].forEach(function(ev){
+  drop.addEventListener(ev, function(e){ e.preventDefault(); drop.classList.remove("over"); });
+});
+drop.addEventListener("drop", function(e){
+  if(e.dataTransfer && e.dataTransfer.files) ingest(e.dataTransfer.files);
+});
+document.getElementById("clear").addEventListener("click", function(){
+  if(FILES.length && !confirm("Alle geladenen Dateien entfernen?")) return;
+  FILES = []; render();
+});
+
+render();
+</script>
+</body>
+</html>
